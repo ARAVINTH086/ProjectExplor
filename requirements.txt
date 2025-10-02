@@ -5,4 +5,6 @@ firebase-admin
 cryptography
 python-dotenv
 python-multipart
+pydantic
+pillow
 
