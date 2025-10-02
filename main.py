@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, Form, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, UploadFile, Form, HTTPException, BackgroundTasks, Depends, File
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import uuid
@@ -176,33 +176,19 @@ async def upload_post(
     location_lng: float = Form(None),
     alt_text: str = Form(""),
     disable_comments: bool = Form(False),
-    file: UploadFile = None,
+    files: List[UploadFile] = File(None),  # CHANGED: Single file → List of files
     token: str = Depends(verify_user_token)
 ):
-    """Upload a post with complete Instagram structure"""
-    if not file:
-        raise HTTPException(status_code=400, detail="No file provided")
+    """Upload a post with complete Instagram structure - supports multiple files (carousel)"""
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+    
+    if len(files) > 10:  # Instagram limit is 10 media items
+        raise HTTPException(status_code=400, detail="Maximum 10 files allowed per post")
     
     try:
-        # Validate file type
-        allowed_types = ['image/jpeg', 'image/png', 'image/gif', 'video/mp4', 'image/webp']
-        if file.content_type not in allowed_types:
-            raise HTTPException(status_code=400, detail=f"File type not allowed. Got {file.content_type}")
-        
-        # Read file content
-        file_content = await file.read()
-        file_size = len(file_content)
-        
-        # Validate file size (10MB limit)
-        if file_size > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large. Maximum size is 10MB")
-        
-        # Upload to Telegram using random bot
-        upload_result = await upload_to_telegram(file_content, file.filename, file.content_type)
-        
         # Generate IDs and timestamps
         post_id = str(uuid.uuid4())
-        media_id = str(uuid.uuid4())
         timestamp = datetime.utcnow().isoformat()
         
         # Build location data
@@ -214,6 +200,47 @@ async def upload_post(
                 "lat": location_lat,
                 "lng": location_lng
             }
+        
+        # Process all files and build media array
+        media_array = []
+        for order_index, file in enumerate(files):
+            # Validate file type for each file
+            allowed_types = ['image/jpeg', 'image/png', 'image/gif', 'video/mp4', 'image/webp']
+            if file.content_type not in allowed_types:
+                logger.warning(f"Skipping file {file.filename}: Invalid type {file.content_type}")
+                continue
+            
+            # Read file content
+            file_content = await file.read()
+            file_size = len(file_content)
+            
+            # Validate file size (10MB limit)
+            if file_size > 10 * 1024 * 1024:
+                logger.warning(f"Skipping file {file.filename}: File too large")
+                continue
+            
+            # Upload to Telegram using random bot
+            upload_result = await upload_to_telegram(file_content, file.filename, file.content_type)
+            
+            # Create media item
+            media_item = {
+                "media_id": str(uuid.uuid4()),
+                "file_unique_id": upload_result["file_unique_id"],
+                "media_type": "image" if file.content_type.startswith('image/') else "video",
+                "file_type": file.content_type,
+                "file_size": file_size,
+                "filename": file.filename,
+                "width": 1080,  # Would need image processing to get actual dimensions
+                "height": 1350,
+                "duration": None,  # Would need video processing
+                "thumbnail_url": upload_result.get("thumbnail_url", ""),
+                "order_index": order_index
+            }
+            
+            media_array.append(media_item)
+        
+        if not media_array:
+            raise HTTPException(status_code=400, detail="No valid files to upload")
         
         # Complete post data structure
         post_data = {
@@ -227,22 +254,12 @@ async def upload_post(
                 "is_business": False
             },
             
-            "media": [{
-                "media_id": media_id,
-                "file_unique_id": upload_result["file_unique_id"],
-                "media_type": "image" if file.content_type.startswith('image/') else "video",
-                "file_type": file.content_type,
-                "width": 1080,  # Would need image processing to get actual dimensions
-                "height": 1350,
-                "duration": None,  # Would need video processing
-                "thumbnail_url": upload_result.get("thumbnail_url", ""),
-                "order_index": 0
-            }],
+            "media": media_array,  # CHANGED: Now contains multiple media items
             
             "content": {
                 "caption": caption,
                 "location": location_data,
-                "alt_text": alt_text or f"Image posted by {username}"
+                "alt_text": alt_text or f"Post by {username}"
             },
             
             "engagement": {
@@ -282,8 +299,9 @@ async def upload_post(
         
         return {
             "status": "success", 
-            "message": "Post uploaded successfully",
+            "message": f"Post uploaded successfully with {len(media_array)} media items",
             "post_id": post_id,
+            "media_count": len(media_array),
             "timestamp": timestamp
         }
         
@@ -307,13 +325,10 @@ async def upload_story(
     text_overlay: str = Form(""),
     close_friends_only: bool = Form(False),
     allow_replies: bool = Form(True),
-    file: UploadFile = None,
+    file: UploadFile = File(...),  # Stories are typically single media
     token: str = Depends(verify_user_token)
 ):
     """Upload a story with 24-hour expiration"""
-    if not file:
-        raise HTTPException(status_code=400, detail="No file provided")
-    
     try:
         # Validate file type
         allowed_types = ['image/jpeg', 'image/png', 'video/mp4']
@@ -614,7 +629,7 @@ async def store_post_data(post_id: str, post_data: dict, user_id: str):
             "score": 1.0  # For feed ranking
         })
         
-        logger.info(f"✅ Post {post_id} stored in Firebase")
+        logger.info(f"✅ Post {post_id} stored in Firebase with {len(post_data['media'])} media items")
         
     except Exception as e:
         logger.error(f"Post storage error: {e}")
@@ -714,10 +729,10 @@ async def root():
     return {
         "message": "Instagram Clone - Complete Data Structure",
         "version": "1.0",
-        "description": "Complete Instagram-like data structure with multi-bot support",
+        "description": "Complete Instagram-like data structure with multi-bot support and carousel posts",
         "endpoints": {
             "user_management": "/create-user/",
-            "posts": "/upload-post/",
+            "posts": "/upload-post/ (supports multiple files)",
             "stories": "/upload-story/",
             "engagement": ["/like-post/", "/add-comment/", "/follow-user/"]
         },
