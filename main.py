@@ -15,9 +15,9 @@ from typing import List, Optional
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Telegram Media Upload System")
+app = FastAPI(title="Instagram Clone API")
 
-# CORS middleware for mobile app compatibility
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,71 +26,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Your Firebase Configuration
+# Firebase Configuration from your service account
 FIREBASE_CONFIG = {
-  "apiKey": "AIzaSyAP4tr0QH1sUizfkzUQXwcFZm7LvEES-sM",
-  "authDomain": "instaclone-aura444.firebaseapp.com",
-  "databaseURL": "https://instaclone-aura444-default-rtdb.firebaseio.com",
-  "projectId": "instaclone-aura444",
-  "storageBucket": "instaclone-aura444.firebasestorage.app",
-  "messagingSenderId": "373529416527",
-  "appId": "1:373529416527:web:9a2c92cd60e4727f816b3a",
-  "measurementId": "G-CG14ZETLLD"
+    "project_id": "instaclone-aura444",
+    "database_url": "https://instaclone-aura444-default-rtdb.firebaseio.com"
 }
 
-# Firebase Initialization
 def initialize_firebase():
+    """Initialize Firebase with environment variables"""
     try:
-        # Check if already initialized
         if firebase_admin._DEFAULT_APP_NAME in firebase_admin._apps:
             logger.info("✅ Firebase already initialized")
-            return
+            return True
             
-        # For Render deployment - use environment variables
-        if all([
-            os.getenv("FIREBASE_PROJECT_ID"),
-            os.getenv("FIREBASE_PRIVATE_KEY"),
-            os.getenv("FIREBASE_CLIENT_EMAIL")
-        ]):
-            # Render deployment - use environment variables
-            service_account_info = {
-                "type": "service_account",
-                "project_id": os.getenv("FIREBASE_PROJECT_ID", FIREBASE_CONFIG["projectId"]),
-                "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-                "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
-                "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-                "client_id": os.getenv("FIREBASE_CLIENT_ID"),
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL")
-            }
-            cred = credentials.Certificate(service_account_info)
-        elif os.path.exists("serviceAccountKey.json"):
-            # Local development with service account file
-            cred = credentials.Certificate("serviceAccountKey.json")
-        else:
-            # Use default credentials (for Google Cloud environments)
-            cred = credentials.ApplicationDefault()
+        # Get credentials from environment variables
+        service_account_info = {
+            "type": "service_account",
+            "project_id": os.getenv("FIREBASE_PROJECT_ID", FIREBASE_CONFIG["project_id"]),
+            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
+            "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
+            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
+            "client_id": os.getenv("FIREBASE_CLIENT_ID"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL")
+        }
         
-        # Initialize Firebase with your database URL
+        # Validate required fields
+        if not service_account_info["private_key"]:
+            logger.error("❌ Firebase private key not found in environment variables")
+            return False
+            
+        cred = credentials.Certificate(service_account_info)
+        
+        # Initialize Firebase
         firebase_admin.initialize_app(cred, {
-            "databaseURL": FIREBASE_CONFIG["databaseURL"],
-            "storageBucket": FIREBASE_CONFIG["storageBucket"]
+            "databaseURL": os.getenv("FIREBASE_DATABASE_URL", FIREBASE_CONFIG["database_url"]),
         })
-        logger.info("✅ Firebase initialized successfully with project: instaclone-aura444")
+        
+        logger.info("✅ Firebase initialized successfully")
+        return True
         
     except Exception as e:
         logger.error(f"❌ Firebase initialization failed: {e}")
-        # Don't raise exception to allow app to start without Firebase
-        # This is useful for testing
+        return False
 
 # Initialize Firebase
-initialize_firebase()
+firebase_initialized = initialize_firebase()
 
-# Telegram Configuration - Set these in environment variables
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@YOUR_CHANNEL")
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 class TelegramUploadError(Exception):
     pass
@@ -98,10 +85,14 @@ class TelegramUploadError(Exception):
 class FirebaseError(Exception):
     pass
 
+def get_db_reference(path: str):
+    """Get Firebase database reference with initialization check"""
+    if not firebase_initialized:
+        raise FirebaseError("Firebase not initialized")
+    return db.reference(path)
+
 async def verify_user_token(token: str = Form(...)):
-    """
-    Basic user verification - enhance this with proper auth in production
-    """
+    """Basic user verification"""
     if not token or token.strip() == "":
         raise HTTPException(status_code=401, detail="Invalid token")
     return token
@@ -116,6 +107,9 @@ async def upload_media(
 ):
     if not file:
         raise HTTPException(status_code=400, detail="No file provided")
+    
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="Telegram bot token not configured")
     
     try:
         # Validate file type
@@ -176,75 +170,11 @@ async def upload_media(
         logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/upload-multiple/")
-async def upload_multiple_media(
-    background_tasks: BackgroundTasks,
-    user_id: str = Form(...),
-    captions: str = Form("[]"),
-    files: List[UploadFile] = None,
-    token: str = Depends(verify_user_token)
-):
-    if not files or len(files) == 0:
-        raise HTTPException(status_code=400, detail="No files provided")
-    
-    try:
-        captions_list = json.loads(captions)
-        post_ids = []
-        file_ids = []
-        
-        for i, file in enumerate(files):
-            caption = captions_list[i] if i < len(captions_list) else ""
-            
-            # Validate file type
-            allowed_types = ['image/jpeg', 'image/png', 'image/gif', 'video/mp4', 'image/webp']
-            if file.content_type not in allowed_types:
-                continue  # Skip invalid files
-            
-            file_content = await file.read()
-            
-            # Validate file size
-            if len(file_content) > 10 * 1024 * 1024:
-                continue  # Skip large files
-            
-            tg_file_id = await upload_to_telegram(file_content, file.filename, file.content_type)
-            
-            post_id = str(uuid.uuid4())
-            feed_item = {
-                "post_id": post_id,
-                "user_id": user_id,
-                "media_file_id": tg_file_id,
-                "filename": file.filename,
-                "file_type": file.content_type,
-                "caption": caption,
-                "timestamp": datetime.utcnow().isoformat(),
-                "is_multiple": True,
-                "order_index": i,
-                "user_profile": f"https://api.dicebear.com/7.x/avataaars/svg?seed={user_id}"
-            }
-            
-            await store_in_firebase(user_id, post_id, feed_item)
-            post_ids.append(post_id)
-            file_ids.append(tg_file_id)
-        
-        return {
-            "status": "success",
-            "post_ids": post_ids,
-            "file_ids": file_ids,
-            "message": f"{len(post_ids)} files uploaded successfully",
-            "user_id": user_id
-        }
-        
-    except Exception as e:
-        logger.error(f"Multiple upload failed: {e}")
-        raise HTTPException(status_code=500, detail="Upload failed")
-
 @app.get("/feed/")
 async def get_feed(limit: int = 20, offset: int = 0):
-    """
-    Retrieve feed posts with pagination
-    """
+    """Retrieve feed posts with pagination"""
     try:
-        ref = db.reference("/timeline")
+        ref = get_db_reference("/timeline")
         timeline_data = ref.order_by_child("timestamp").limit_to_last(limit + offset).get()
         
         if not timeline_data:
@@ -265,7 +195,7 @@ async def get_feed(limit: int = 20, offset: int = 0):
         # Generate Telegram file URLs for client-side access
         for post in paginated_posts:
             file_id = post.get('media_file_id', '')
-            if file_id:
+            if file_id and TELEGRAM_BOT_TOKEN:
                 post['media_url'] = await get_telegram_file_url(file_id)
         
         return {
@@ -280,11 +210,9 @@ async def get_feed(limit: int = 20, offset: int = 0):
 
 @app.get("/user-posts/{user_id}")
 async def get_user_posts(user_id: str, limit: int = 20, offset: int = 0):
-    """
-    Get posts for a specific user
-    """
+    """Get posts for a specific user"""
     try:
-        ref = db.reference(f"/feeds/{user_id}")
+        ref = get_db_reference(f"/feeds/{user_id}")
         user_posts = ref.order_by_child("timestamp").limit_to_last(limit + offset).get()
         
         if not user_posts:
@@ -297,7 +225,7 @@ async def get_user_posts(user_id: str, limit: int = 20, offset: int = 0):
         
         for post in paginated_posts:
             file_id = post.get('media_file_id', '')
-            if file_id:
+            if file_id and TELEGRAM_BOT_TOKEN:
                 post['media_url'] = await get_telegram_file_url(file_id)
         
         return {
@@ -310,68 +238,8 @@ async def get_user_posts(user_id: str, limit: int = 20, offset: int = 0):
         logger.error(f"User posts retrieval failed: {e}")
         return {"posts": [], "has_more": False, "total": 0, "error": str(e)}
 
-@app.delete("/post/{user_id}/{post_id}")
-async def delete_post(
-    user_id: str,
-    post_id: str,
-    token: str = Depends(verify_user_token)
-):
-    """
-    Delete a specific post
-    """
-    try:
-        # Delete from user feed
-        user_ref = db.reference(f"/feeds/{user_id}/{post_id}")
-        user_ref.delete()
-        
-        # Delete from timeline
-        timeline_ref = db.reference(f"/timeline/{post_id}")
-        timeline_ref.delete()
-        
-        return {
-            "status": "success", 
-            "message": "Post deleted successfully",
-            "post_id": post_id
-        }
-        
-    except Exception as e:
-        logger.error(f"Post deletion failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete post")
-
-@app.put("/post/{user_id}/{post_id}/like")
-async def like_post(
-    user_id: str,
-    post_id: str,
-    token: str = Depends(verify_user_token)
-):
-    """
-    Like a post
-    """
-    try:
-        # Update in user feed
-        user_ref = db.reference(f"/feeds/{user_id}/{post_id}/likes")
-        current_likes = user_ref.get() or 0
-        user_ref.set(current_likes + 1)
-        
-        # Update in timeline
-        timeline_ref = db.reference(f"/timeline/{post_id}/likes")
-        timeline_ref.set(current_likes + 1)
-        
-        return {
-            "status": "success", 
-            "message": "Post liked",
-            "post_id": post_id,
-            "likes": current_likes + 1
-        }
-        
-    except Exception as e:
-        logger.error(f"Like post failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to like post")
-
 async def upload_to_telegram(file_content: bytes, filename: str, content_type: str) -> str:
-    """
-    Upload media to Telegram and return file_id
-    """
+    """Upload media to Telegram and return file_id"""
     try:
         # For images, use sendPhoto API for better quality
         if content_type.startswith('image/'):
@@ -393,7 +261,6 @@ async def upload_to_telegram(file_content: bytes, filename: str, content_type: s
         
         # Extract file_id from response
         if 'photo' in result["result"]:
-            # For photos, get the largest size file_id
             return result["result"]["photo"][-1]["file_id"]
         elif 'document' in result["result"]:
             return result["result"]["document"]["file_id"]
@@ -406,11 +273,11 @@ async def upload_to_telegram(file_content: bytes, filename: str, content_type: s
         raise TelegramUploadError(f"Network error: {e}")
 
 async def get_telegram_file_url(file_id: str) -> str:
-    """
-    Get direct URL for Telegram file
-    """
+    """Get direct URL for Telegram file"""
     try:
-        # First get file path
+        if not TELEGRAM_BOT_TOKEN:
+            return ""
+            
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
         response = requests.post(url, data={"file_id": file_id})
         result = response.json()
@@ -418,22 +285,19 @@ async def get_telegram_file_url(file_id: str) -> str:
         if result.get("ok"):
             file_path = result["result"]["file_path"]
             return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-        else:
-            return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_id}"
+        return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_id}"
     except:
         return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_id}"
 
 async def store_in_firebase(user_id: str, post_id: str, feed_item: dict):
-    """
-    Store post metadata in Firebase
-    """
+    """Store post metadata in Firebase"""
     try:
         # Store under user's feed
-        user_ref = db.reference(f"/feeds/{user_id}/{post_id}")
+        user_ref = get_db_reference(f"/feeds/{user_id}/{post_id}")
         user_ref.set(feed_item)
         
         # Also store in global timeline for easier querying
-        timeline_ref = db.reference(f"/timeline/{post_id}")
+        timeline_ref = get_db_reference(f"/timeline/{post_id}")
         timeline_ref.set(feed_item)
         
         logger.info(f"✅ Stored post {post_id} for user {user_id} in Firebase")
@@ -443,12 +307,9 @@ async def store_in_firebase(user_id: str, post_id: str, feed_item: dict):
         raise FirebaseError(f"Firebase operation failed: {e}")
 
 async def process_upload_analytics(user_id: str, post_id: str):
-    """
-    Background task for analytics processing
-    """
+    """Background task for analytics processing"""
     try:
-        # Update user upload count
-        user_ref = db.reference(f"/users/{user_id}")
+        user_ref = get_db_reference(f"/users/{user_id}")
         user_data = user_ref.get() or {}
         
         upload_count = user_data.get('upload_count', 0) + 1
@@ -469,24 +330,29 @@ async def process_upload_analytics(user_id: str, post_id: str):
 async def health_check():
     """Health check endpoint"""
     try:
+        if not firebase_initialized:
+            return {
+                "status": "unhealthy",
+                "timestamp": datetime.utcnow().isoformat(),
+                "firebase": "not_initialized",
+                "telegram": "configured" if TELEGRAM_BOT_TOKEN else "not_configured"
+            }
+            
         # Test Firebase connection
-        ref = db.reference("/health_check")
+        ref = get_db_reference("/health_check")
         test_data = {
             "timestamp": datetime.utcnow().isoformat(),
-            "project": FIREBASE_CONFIG["projectId"],
+            "project": FIREBASE_CONFIG["project_id"],
             "status": "connected"
         }
         ref.set(test_data)
-        
-        # Test read
-        retrieved_data = ref.get()
         
         return {
             "status": "healthy", 
             "timestamp": datetime.utcnow().isoformat(),
             "firebase": "connected",
-            "project": FIREBASE_CONFIG["projectId"],
-            "database": FIREBASE_CONFIG["databaseURL"]
+            "telegram": "configured" if TELEGRAM_BOT_TOKEN else "not_configured",
+            "project": FIREBASE_CONFIG["project_id"]
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
@@ -494,6 +360,7 @@ async def health_check():
             "status": "unhealthy",
             "timestamp": datetime.utcnow().isoformat(),
             "firebase": "disconnected",
+            "telegram": "configured" if TELEGRAM_BOT_TOKEN else "not_configured",
             "error": str(e)
         }
 
@@ -501,14 +368,20 @@ async def health_check():
 async def test_firebase():
     """Test Firebase connection"""
     try:
+        if not firebase_initialized:
+            return {
+                "status": "error",
+                "message": "Firebase not initialized. Check environment variables."
+            }
+            
         test_data = {
             "test_id": str(uuid.uuid4()),
             "timestamp": datetime.utcnow().isoformat(),
             "message": "Test from FastAPI",
-            "project": FIREBASE_CONFIG["projectId"]
+            "project": FIREBASE_CONFIG["project_id"]
         }
         
-        ref = db.reference("/test_connection")
+        ref = get_db_reference("/test_connection")
         ref.set(test_data)
         
         # Read back the data
@@ -518,14 +391,14 @@ async def test_firebase():
             "status": "success",
             "written": test_data,
             "read": retrieved_data,
-            "message": f"Firebase connection working for project: {FIREBASE_CONFIG['projectId']}",
-            "database_url": FIREBASE_CONFIG["databaseURL"]
+            "message": f"Firebase connection working for project: {FIREBASE_CONFIG['project_id']}",
+            "database_url": FIREBASE_CONFIG["database_url"]
         }
     except Exception as e:
         return {
             "status": "error",
             "message": f"Firebase connection failed: {e}",
-            "project": FIREBASE_CONFIG["projectId"]
+            "project": FIREBASE_CONFIG["project_id"]
         }
 
 @app.get("/")
@@ -534,32 +407,17 @@ async def root():
     return {
         "message": "Instagram Clone API with Telegram Storage",
         "version": "1.0",
-        "project": FIREBASE_CONFIG["projectId"],
+        "project": FIREBASE_CONFIG["project_id"],
+        "firebase_initialized": firebase_initialized,
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
         "endpoints": {
             "health": "/health",
             "test_firebase": "/test-firebase",
             "upload": "/upload/",
             "feed": "/feed/",
-            "user_posts": "/user-posts/{user_id}",
-            "like_post": "/post/{user_id}/{post_id}/like",
-            "delete_post": "/post/{user_id}/{post_id}"
+            "user_posts": "/user-posts/{user_id}"
         }
     }
-
-# Error handlers
-@app.exception_handler(TelegramUploadError)
-async def telegram_upload_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=500,
-        content={"detail": str(exc)}
-    )
-
-@app.exception_handler(FirebaseError)
-async def firebase_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=500,
-        content={"detail": str(exc)}
-    )
 
 if __name__ == "__main__":
     import uvicorn
