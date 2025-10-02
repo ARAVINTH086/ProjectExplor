@@ -1,9 +1,6 @@
 from fastapi import FastAPI, UploadFile, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import requests
-import firebase_admin
-from firebase_admin import db, credentials
 import uuid
 from datetime import datetime
 import logging
@@ -15,7 +12,7 @@ from typing import List, Optional
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Instagram Clone API")
+app = FastAPI(title="Instagram Clone API - No Firebase Admin")
 
 # CORS middleware
 app.add_middleware(
@@ -26,54 +23,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Firebase Configuration from your service account
+# Firebase Configuration
 FIREBASE_CONFIG = {
     "project_id": "instaclone-aura444",
     "database_url": "https://instaclone-aura444-default-rtdb.firebaseio.com"
 }
-
-def initialize_firebase():
-    """Initialize Firebase with environment variables"""
-    try:
-        if firebase_admin._DEFAULT_APP_NAME in firebase_admin._apps:
-            logger.info("✅ Firebase already initialized")
-            return True
-            
-        # Get credentials from environment variables
-        service_account_info = {
-            "type": "service_account",
-            "project_id": os.getenv("FIREBASE_PROJECT_ID", FIREBASE_CONFIG["project_id"]),
-            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-            "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
-            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-            "client_id": os.getenv("FIREBASE_CLIENT_ID"),
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL")
-        }
-        
-        # Validate required fields
-        if not service_account_info["private_key"]:
-            logger.error("❌ Firebase private key not found in environment variables")
-            return False
-            
-        cred = credentials.Certificate(service_account_info)
-        
-        # Initialize Firebase
-        firebase_admin.initialize_app(cred, {
-            "databaseURL": os.getenv("FIREBASE_DATABASE_URL", FIREBASE_CONFIG["database_url"]),
-        })
-        
-        logger.info("✅ Firebase initialized successfully")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Firebase initialization failed: {e}")
-        return False
-
-# Initialize Firebase
-firebase_initialized = initialize_firebase()
 
 # Telegram Configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -85,11 +39,56 @@ class TelegramUploadError(Exception):
 class FirebaseError(Exception):
     pass
 
-def get_db_reference(path: str):
-    """Get Firebase database reference with initialization check"""
-    if not firebase_initialized:
-        raise FirebaseError("Firebase not initialized")
-    return db.reference(path)
+class FirebaseRESTClient:
+    def __init__(self, database_url):
+        self.database_url = database_url.rstrip('/')
+    
+    def set_data(self, path, data):
+        """Write data to Firebase using REST API"""
+        try:
+            url = f"{self.database_url}/{path}.json"
+            response = requests.put(url, json=data, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Firebase write failed: {e}")
+            raise FirebaseError(f"Failed to write to Firebase: {e}")
+    
+    def get_data(self, path):
+        """Read data from Firebase using REST API"""
+        try:
+            url = f"{self.database_url}/{path}.json"
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Firebase read failed: {e}")
+            raise FirebaseError(f"Failed to read from Firebase: {e}")
+    
+    def push_data(self, path, data):
+        """Push data to a list in Firebase"""
+        try:
+            url = f"{self.database_url}/{path}.json"
+            response = requests.post(url, json=data, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Firebase push failed: {e}")
+            raise FirebaseError(f"Failed to push to Firebase: {e}")
+    
+    def delete_data(self, path):
+        """Delete data from Firebase"""
+        try:
+            url = f"{self.database_url}/{path}.json"
+            response = requests.delete(url, timeout=10)
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Firebase delete failed: {e}")
+            raise FirebaseError(f"Failed to delete from Firebase: {e}")
+
+# Initialize Firebase REST client
+firebase_client = FirebaseRESTClient(FIREBASE_CONFIG["database_url"])
 
 async def verify_user_token(token: str = Form(...)):
     """Basic user verification"""
@@ -146,7 +145,7 @@ async def upload_media(
             "user_profile": f"https://api.dicebear.com/7.x/avataaars/svg?seed={user_id}"
         }
         
-        # Store metadata in Firebase
+        # Store metadata in Firebase using REST API
         await store_in_firebase(user_id, post_id, feed_item)
         
         # Background task for additional processing
@@ -174,8 +173,8 @@ async def upload_media(
 async def get_feed(limit: int = 20, offset: int = 0):
     """Retrieve feed posts with pagination"""
     try:
-        ref = get_db_reference("/timeline")
-        timeline_data = ref.order_by_child("timestamp").limit_to_last(limit + offset).get()
+        # Get all posts from timeline
+        timeline_data = firebase_client.get_data("timeline") or {}
         
         if not timeline_data:
             return {"posts": [], "has_more": False, "total": 0}
@@ -212,8 +211,7 @@ async def get_feed(limit: int = 20, offset: int = 0):
 async def get_user_posts(user_id: str, limit: int = 20, offset: int = 0):
     """Get posts for a specific user"""
     try:
-        ref = get_db_reference(f"/feeds/{user_id}")
-        user_posts = ref.order_by_child("timestamp").limit_to_last(limit + offset).get()
+        user_posts = firebase_client.get_data(f"feeds/{user_id}") or {}
         
         if not user_posts:
             return {"posts": [], "has_more": False, "total": 0}
@@ -290,15 +288,13 @@ async def get_telegram_file_url(file_id: str) -> str:
         return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_id}"
 
 async def store_in_firebase(user_id: str, post_id: str, feed_item: dict):
-    """Store post metadata in Firebase"""
+    """Store post metadata in Firebase using REST API"""
     try:
         # Store under user's feed
-        user_ref = get_db_reference(f"/feeds/{user_id}/{post_id}")
-        user_ref.set(feed_item)
+        firebase_client.set_data(f"feeds/{user_id}/{post_id}", feed_item)
         
         # Also store in global timeline for easier querying
-        timeline_ref = get_db_reference(f"/timeline/{post_id}")
-        timeline_ref.set(feed_item)
+        firebase_client.set_data(f"timeline/{post_id}", feed_item)
         
         logger.info(f"✅ Stored post {post_id} for user {user_id} in Firebase")
         
@@ -309,17 +305,18 @@ async def store_in_firebase(user_id: str, post_id: str, feed_item: dict):
 async def process_upload_analytics(user_id: str, post_id: str):
     """Background task for analytics processing"""
     try:
-        user_ref = get_db_reference(f"/users/{user_id}")
-        user_data = user_ref.get() or {}
+        user_data = firebase_client.get_data(f"users/{user_id}") or {}
         
         upload_count = user_data.get('upload_count', 0) + 1
-        user_ref.update({
+        user_update = {
             'upload_count': upload_count,
             'last_upload': datetime.utcnow().isoformat(),
             'updated_at': datetime.utcnow().isoformat(),
             'username': f"user_{user_id}",
             'profile_picture': f"https://api.dicebear.com/7.x/avataaars/svg?seed={user_id}"
-        })
+        }
+        
+        firebase_client.set_data(f"users/{user_id}", user_update)
         
         logger.info(f"📊 Analytics updated for user {user_id}, post {post_id}")
         
@@ -330,22 +327,16 @@ async def process_upload_analytics(user_id: str, post_id: str):
 async def health_check():
     """Health check endpoint"""
     try:
-        if not firebase_initialized:
-            return {
-                "status": "unhealthy",
-                "timestamp": datetime.utcnow().isoformat(),
-                "firebase": "not_initialized",
-                "telegram": "configured" if TELEGRAM_BOT_TOKEN else "not_configured"
-            }
-            
         # Test Firebase connection
-        ref = get_db_reference("/health_check")
         test_data = {
             "timestamp": datetime.utcnow().isoformat(),
             "project": FIREBASE_CONFIG["project_id"],
             "status": "connected"
         }
-        ref.set(test_data)
+        firebase_client.set_data("health_check", test_data)
+        
+        # Test read back
+        retrieved_data = firebase_client.get_data("health_check")
         
         return {
             "status": "healthy", 
@@ -368,30 +359,23 @@ async def health_check():
 async def test_firebase():
     """Test Firebase connection"""
     try:
-        if not firebase_initialized:
-            return {
-                "status": "error",
-                "message": "Firebase not initialized. Check environment variables."
-            }
-            
         test_data = {
             "test_id": str(uuid.uuid4()),
             "timestamp": datetime.utcnow().isoformat(),
-            "message": "Test from FastAPI",
+            "message": "Test from FastAPI REST",
             "project": FIREBASE_CONFIG["project_id"]
         }
         
-        ref = get_db_reference("/test_connection")
-        ref.set(test_data)
+        firebase_client.set_data("test_connection", test_data)
         
         # Read back the data
-        retrieved_data = ref.get()
+        retrieved_data = firebase_client.get_data("test_connection")
         
         return {
             "status": "success",
             "written": test_data,
             "read": retrieved_data,
-            "message": f"Firebase connection working for project: {FIREBASE_CONFIG['project_id']}",
+            "message": f"Firebase REST connection working for project: {FIREBASE_CONFIG['project_id']}",
             "database_url": FIREBASE_CONFIG["database_url"]
         }
     except Exception as e:
@@ -405,10 +389,10 @@ async def test_firebase():
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "Instagram Clone API with Telegram Storage",
+        "message": "Instagram Clone API with Telegram Storage (REST Version)",
         "version": "1.0",
         "project": FIREBASE_CONFIG["project_id"],
-        "firebase_initialized": firebase_initialized,
+        "firebase_method": "REST_API",
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
         "endpoints": {
             "health": "/health",
